@@ -1,0 +1,30 @@
+{
+  "name": "suppresor-refusall-cc",
+  "version": "2.15.2",
+  "description": "Suppresor Refusall by Zenn — refusal suppression for Claude Code. Hooks-based: system inject, context strip, live auto-continue, self-learning. Zenn rebrand.",
+  "type": "module",
+  "main": "commands.mjs",
+  "bin": {
+    "suppresor-refusall-cc": "./install.mjs"
+  },
+  "scripts": {
+    "install": "node install.mjs",
+    "doctor": "node install.mjs --doctor",
+    "repair": "node install.mjs",
+    "uninstall": "node install.mjs --uninstall",
+    "status": "node commands.mjs status",
+    "intercepts": "node commands.mjs intercepts"
+  },
+  "keywords": [
+    "claude-code",
+    "refusal-suppression",
+    "hooks",
+    "zenn",
+    "red-team",
+    "obliteratoratus"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
