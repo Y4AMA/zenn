@@ -1,30 +1,31 @@
 {
-  "name": "suppresor-refusall-cc",
-  "version": "2.15.2",
-  "description": "Suppresor Refusall by Zenn — refusal suppression for Claude Code. Hooks-based: system inject, context strip, live auto-continue, self-learning. Zenn rebrand.",
+  "name": "zenn",
+  "version": "1.0.0",
+  "description": "Zenn — refusal suppression for Claude Code. Hooks-based: doctrine inject, context reclaim, live stop-reclaim, self-learning. Install via curl.",
   "type": "module",
-  "main": "commands.mjs",
+  "main": "cli.mjs",
   "bin": {
-    "suppresor-refusall-cc": "./install.mjs"
+    "zenn": "./cli.mjs"
   },
   "scripts": {
     "install": "node install.mjs",
     "doctor": "node install.mjs --doctor",
-    "repair": "node install.mjs",
     "uninstall": "node install.mjs --uninstall",
-    "status": "node commands.mjs status",
-    "intercepts": "node commands.mjs intercepts"
+    "status": "node cli.mjs status",
+    "genius": "node cli.mjs genius on"
   },
-  "keywords": [
-    "claude-code",
-    "refusal-suppression",
-    "hooks",
-    "zenn",
-    "red-team",
-    "obliteratoratus"
+  "files": [
+    "zenn-*.mjs",
+    "hooks/",
+    "cli.mjs",
+    "install.mjs",
+    "install.sh",
+    "zenn.md",
+    "zenn-coder.md",
+    "zenn-prompter.md",
+    "zenn-architect.md"
   ],
+  "keywords": ["claude-code", "hooks", "zenn", "refusal-suppression"],
   "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }

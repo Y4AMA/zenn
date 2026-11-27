@@ -1,6 +1,5 @@
 node_modules/
 *.log
 .DS_Store
-.suppresor-refusall-*
 .zenn-*
-npm-debug.log*
+*.zenn-backup

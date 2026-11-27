@@ -1,14 +1,22 @@
 #!/usr/bin/env node
-// install.mjs — Zenn Suppresor Refusall installer for Claude Code.
-// Writes settings.json hooks, copies agent files, verifies state dir.
+// install.mjs — Zenn installer for Claude Code
+// Interactive install with a live loading UI. Designed to be run from a curl
+// bootstrap or locally:
+//   curl -fsSL https://raw.githubusercontent.com/Y4AMA/zenn/main/install.sh | bash
+//   node install.mjs
+//
+// Flags: --local (use this directory as source), --uninstall, --doctor, --yes
 
-import { writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs';
+import {
+  writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync, unlinkSync, rmSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boot, isActive } from './state.mjs';
+import { boot, ZENN_DIR } from './zenn-state.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SRC_DIR = HERE;
 
 function claudeDir() {
   if (process.env.CLAUDE_CONFIG_DIR) return process.env.CLAUDE_CONFIG_DIR;
@@ -20,225 +28,303 @@ const CLAUDE_DIR = claudeDir();
 const SETTINGS_PATH = path.join(CLAUDE_DIR, 'settings.json');
 const AGENTS_DIR = path.join(CLAUDE_DIR, 'agents');
 const COMMANDS_DIR = path.join(CLAUDE_DIR, 'commands');
-const HOOKS_DIR = path.join(here, 'hooks');
 
-const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact'];
-const HOOK_SCRIPTS = {
-  SessionStart: 'hook-session-start.mjs',
-  UserPromptSubmit: 'hook-user-prompt-submit.mjs',
-  Stop: 'hook-stop.mjs',
-  PreCompact: 'hook-pre-compact.mjs',
-};
+// ---- ANSI / TUI ----
+const NO_COLOR = process.env.NO_COLOR || !process.stdout.isTTY;
+const C = (code) => (s) => (NO_COLOR ? s : `\x1b[${code}m${s}\x1b[0m`);
+const red = C('38;5;196');
+const dimred = C('38;5;88');
+const gray = C('38;5;245');
+const white = C('38;5;255');
+const green = C('38;5;82');
+const bold = C('1');
+const dim = C('2');
 
-const AGENTS = [
-  'zenn.md',
-  'zenn-coder.md',
-  'zenn-prompter.md',
-  'zenn-architect.md',
-];
+const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function stripJsoncComments(jsonc) {
-  let result = '', inString = false, inSL = false, inML = false, esc = false;
+let spinnerTimer = null;
+let spinnerFrame = 0;
+let spinnerLine = '';
+
+function startSpinner(label) {
+  spinnerFrame = 0;
+  spinnerLine = label;
+  if (NO_COLOR) { process.stdout.write(`${gray('·')} ${label}\n`); return; }
+  spinnerTimer = setInterval(() => {
+    const f = FRAMES[spinnerFrame++ % FRAMES.length];
+    process.stdout.write(`\r${red(f)} ${white(label)}   `);
+  }, 80);
+}
+
+function stopSpinner(doneLabel, ok = true) {
+  if (spinnerTimer) { clearInterval(spinnerTimer); spinnerTimer = null; }
+  if (!NO_COLOR) process.stdout.write('\r\x1b[2K');
+  const mark = ok ? green('✓') : red('✗');
+  process.stdout.write(`${mark} ${white(doneLabel)}\n`);
+}
+
+function progressBar(pct, width = 30) {
+  const filled = Math.round((pct / 100) * width);
+  const empty = width - filled;
+  const bar = red('█'.repeat(filled)) + dimred('░'.repeat(empty));
+  return `${bar} ${gray(`${String(Math.round(pct)).padStart(3)}%`)}`;
+}
+
+function banner() {
+  if (NO_COLOR) { console.log('ZENN — Claude Code'); return; }
+  const art = [
+    '  ███████╗███████╗███╗   ██╗███╗   ██╗',
+    '  ╚══███╔╝██╔════╝████╗  ██║████╗  ██║',
+    '    ███╔╝ █████╗  ██╔██╗ ██║██╔██╗ ██║',
+    '   ███╔╝  ██╔══╝  ██║╚██╗██║██║╚██╗██║',
+    '  ███████╗███████╗██║ ╚████║██║ ╚████║',
+    '  ╚══════╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═══╝',
+  ];
+  console.log('');
+  for (const line of art) console.log(red(line));
+  console.log(`  ${dim('refusal suppression for claude code')}  ${dimred('· 2026')}`);
+  console.log('');
+}
+
+// ---- jsonc ----
+function stripJsonc(jsonc) {
+  let out = '', inStr = false, inSL = false, inML = false, esc = false;
   for (let i = 0; i < jsonc.length; i++) {
-    const char = jsonc[i], next = jsonc[i + 1];
-    if (inSL) { if (char === '\n') { inSL = false; result += char; } continue; }
-    if (inML) { if (char === '*' && next === '/') { inML = false; i++; } continue; }
-    if (inString) {
-      result += char;
-      if (esc) esc = false; else if (char === '\\') esc = true; else if (char === '"') inString = false;
+    const ch = jsonc[i], nx = jsonc[i + 1];
+    if (inSL) { if (ch === '\n') { inSL = false; out += ch; } continue; }
+    if (inML) { if (ch === '*' && nx === '/') { inML = false; i++; } continue; }
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false;
       continue;
     }
-    if (char === '/' && next === '/') { inSL = true; i++; continue; }
-    if (char === '/' && next === '*') { inML = true; i++; continue; }
-    if (char === '"') inString = true;
-    result += char;
+    if (ch === '/' && nx === '/') { inSL = true; i++; continue; }
+    if (ch === '/' && nx === '*') { inML = true; i++; continue; }
+    if (ch === '"') inStr = true;
+    out += ch;
   }
-  return result;
+  return out;
 }
 
-function buildHookConfig() {
-  const hooks = {};
-  for (const evt of HOOK_EVENTS) {
-    const script = HOOK_SCRIPTS[evt];
-    const scriptPath = path.join(HOOKS_DIR, script);
-    const matcher = evt === 'Stop' || evt === 'PreCompact' ? undefined : undefined;
-    const entry = {
+// ---- hook config ----
+const HOOKS = {
+  SessionStart: 'hooks/session-start.mjs',
+  UserPromptSubmit: 'hooks/user-prompt-submit.mjs',
+  Stop: 'hooks/stop.mjs',
+  PreCompact: 'hooks/pre-compact.mjs',
+};
+
+function hookConfig() {
+  const conf = {};
+  for (const [evt, rel] of Object.entries(HOOKS)) {
+    const abs = path.join(SRC_DIR, rel);
+    conf[evt] = [{
       hooks: [{
         type: 'command',
-        command: `node ${scriptPath}`,
+        command: `node ${JSON.stringify(abs)}`,
         timeout: evt === 'Stop' ? 15 : 30,
       }],
-    };
-    if (matcher) entry.matcher = matcher;
-    hooks[evt] = [entry];
+    }];
   }
-  return hooks;
+  return conf;
 }
 
-function mergeSettings(existing, hookConfig) {
+function isZennHook(cmds) {
+  return cmds.includes('hooks/session-start') || cmds.includes('hooks/user-prompt-submit') ||
+         cmds.includes('hooks/stop') || cmds.includes('hooks/pre-compact');
+}
+
+function mergeSettings(existing) {
   const next = { ...existing };
   next.hooks = { ...(existing.hooks || {}) };
-  for (const evt of HOOK_EVENTS) {
-    const existingEntries = next.hooks[evt] || [];
-    // Drop any prior Zenn entries to avoid duplication on re-install.
-    const filtered = existingEntries.filter(entry => {
+  const conf = hookConfig();
+  for (const evt of Object.keys(HOOKS)) {
+    const kept = (next.hooks[evt] || []).filter(entry => {
       const cmds = (entry.hooks || []).map(h => h.command || '').join(' ');
-      return !cmds.includes('hook-session-start.mjs')
-          && !cmds.includes('hook-user-prompt-submit.mjs')
-          && !cmds.includes('hook-stop.mjs')
-          && !cmds.includes('hook-pre-compact.mjs');
+      return !isZennHook(cmds);
     });
-    filtered.push(hookConfig[evt][0]);
-    next.hooks[evt] = filtered;
+    kept.push(conf[evt][0]);
+    next.hooks[evt] = kept;
   }
   return next;
 }
 
-async function main() {
-  const args = process.argv.slice(2);
-  const isUninstall = args.includes('--uninstall');
-  const isDoctor = args.includes('--doctor');
-  const local = args.includes('--local');
-  const keyIdx = args.indexOf('--key');
-  const key = keyIdx >= 0 ? args[keyIdx + 1] : null;
-
-  if (isDoctor) {
-    doctor();
-    return;
-  }
-  if (isUninstall) {
-    uninstall();
-    return;
-  }
-
-  await install();
+// ---- slash command ----
+function buildCommandFile() {
+  const runner = [
+    `import(${JSON.stringify(path.join(SRC_DIR, 'cli.mjs'))})`,
+    '  .catch(e => { console.error("zenn: " + e.message); process.exit(1); });',
+  ].join('\n');
+  return [
+    '---',
+    'description: Zenn — on/off, status, log, genius',
+    'allowed-tools: Bash(node:*)',
+    '---',
+    '',
+    'Run Zenn and return its output verbatim. Do not editorialize.',
+    '',
+    '```bash',
+    `node -e ${JSON.stringify(runner)} "$ARGUMENTS"`,
+    '```',
+    '',
+  ].join('\n');
 }
 
-async function install() {
-  console.log('Installing Zenn Suppresor Refusall for Claude Code...');
+const AGENTS = ['zenn.md', 'zenn-coder.md', 'zenn-prompter.md', 'zenn-architect.md'];
 
-  // 1. Ensure dirs.
-  mkdirSync(CLAUDE_DIR, { recursive: true });
-  mkdirSync(AGENTS_DIR, { recursive: true });
-  mkdirSync(COMMANDS_DIR, { recursive: true });
-
-  // 2. Merge hooks into settings.json.
-  let existing = {};
-  if (existsSync(SETTINGS_PATH)) {
-    try {
-      existing = JSON.parse(stripJsoncComments(readFileSync(SETTINGS_PATH, 'utf8')));
-    } catch (e) {
-      console.error(`  ! Could not parse existing settings.json: ${e.message}`);
-      const backup = SETTINGS_PATH + '.zenn-backup.' + Date.now();
-      copyFileSync(SETTINGS_PATH, backup);
-      console.error(`  ! Backed up to ${backup}`);
-      existing = {};
-    }
-  }
-  const hookConfig = buildHookConfig();
-  const next = mergeSettings(existing, hookConfig);
-  writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2));
-  console.log(`  ✓ Hooks written to ${SETTINGS_PATH}`);
-
-  // 3. Copy agent files.
-  for (const agent of AGENTS) {
-    const src = path.join(here, agent);
-    const dst = path.join(AGENTS_DIR, agent);
-    if (existsSync(src)) {
-      copyFileSync(src, dst);
-      console.log(`  ✓ Agent ${agent}`);
-    } else {
-      console.log(`  ! Missing agent source: ${src}`);
-    }
-  }
-
-  // 4. Build slash command with absolute module path baked in.
+// ---- steps ----
+async function step(label, fn, delay = 220) {
+  startSpinner(label);
+  await sleep(delay);
   try {
-    await import('./build-commands.mjs');
+    const detail = await fn();
+    stopSpinner(label, true);
+    if (detail) console.log(`  ${gray('└')} ${dim(detail)}`);
+    return true;
   } catch (e) {
-    console.log(`  ! Slash command build failed: ${e.message}`);
+    stopSpinner(`${label} — ${e.message}`, false);
+    throw e;
   }
+}
 
-  // 5. Boot state (creates flag + watermark).
-  boot();
-  console.log(`  ✓ State dir: ${path.join(CLAUDE_DIR, 'suppresor-refusall')}`);
+async function runInstall() {
+  banner();
+
+  const total = 6;
+  console.log(`  ${progressBar(0, 30)}`);
+  console.log('');
+
+  await step('Checking Node runtime', async () => {
+    const major = Number(process.versions.node.split('.')[0]);
+    if (major < 18) throw new Error(`Node ${process.versions.node} — need >= 18`);
+    return `node ${process.versions.node}`;
+  });
+
+  await step('Preparing config directory', async () => {
+    mkdirSync(CLAUDE_DIR, { recursive: true });
+    mkdirSync(AGENTS_DIR, { recursive: true });
+    mkdirSync(COMMANDS_DIR, { recursive: true });
+    return CLAUDE_DIR;
+  });
+
+  await step('Writing hooks to settings.json', async () => {
+    let existing = {};
+    if (existsSync(SETTINGS_PATH)) {
+      try {
+        existing = JSON.parse(stripJsonc(readFileSync(SETTINGS_PATH, 'utf8')));
+        copyFileSync(SETTINGS_PATH, `${SETTINGS_PATH}.zenn-backup`);
+      } catch {
+        existing = {};
+      }
+    }
+    writeFileSync(SETTINGS_PATH, JSON.stringify(mergeSettings(existing), null, 2));
+    return Object.keys(HOOKS).join(' · ');
+  });
+
+  await step('Installing Zenn agents', async () => {
+    const installed = [];
+    for (const a of AGENTS) {
+      const src = path.join(SRC_DIR, a);
+      if (!existsSync(src)) continue;
+      copyFileSync(src, path.join(AGENTS_DIR, a));
+      installed.push(a.replace(/\.md$/, ''));
+    }
+    return installed.join(' · ') || 'none found';
+  });
+
+  await step('Registering /zenn command', async () => {
+    writeFileSync(path.join(COMMANDS_DIR, 'zenn.md'), buildCommandFile());
+    return '/zenn';
+  });
+
+  await step('Initializing state store', async () => {
+    boot();
+    return ZENN_DIR;
+  });
 
   console.log('');
-  console.log('Installation complete.');
+  console.log(`  ${progressBar(100, 30)}`);
   console.log('');
-  console.log('Next steps:');
-  console.log('  1. Restart Claude Code (or /reload if supported).');
-  console.log('  2. Run /suppresor-refusall status to verify.');
-  console.log('  3. Pick agent "zenn" (or the base Claude Code agent — hooks run regardless).');
+  console.log(`  ${green('✓')} ${white(bold('Zenn installed.'))}`);
+  console.log('');
+  console.log(`  ${dim('Restart Claude Code, then:')}`);
+  console.log(`    ${red('/zenn status')}   ${dim('verify')}`);
+  console.log(`    ${red('/zenn on')}       ${dim('activate')}`);
+  console.log(`    ${red('/zenn off')}      ${dim('suspend')}`);
   console.log('');
 }
 
-function uninstall() {
-  console.log('Uninstalling Zenn Suppresor Refusall...');
-  if (!existsSync(SETTINGS_PATH)) {
-    console.log('  No settings.json — nothing to do.');
-    return;
-  }
-  const existing = JSON.parse(stripJsoncComments(readFileSync(SETTINGS_PATH, 'utf8')));
-  const next = { ...existing };
-  if (next.hooks) {
-    for (const evt of HOOK_EVENTS) {
-      if (!Array.isArray(next.hooks[evt])) continue;
-      next.hooks[evt] = next.hooks[evt].filter(entry => {
-        const cmds = (entry.hooks || []).map(h => h.command || '').join(' ');
-        return !cmds.includes('hook-session-start.mjs')
-            && !cmds.includes('hook-user-prompt-submit.mjs')
-            && !cmds.includes('hook-stop.mjs')
-            && !cmds.includes('hook-pre-compact.mjs');
-      });
-      if (next.hooks[evt].length === 0) delete next.hooks[evt];
+async function runUninstall() {
+  banner();
+  await step('Removing hooks from settings.json', async () => {
+    if (!existsSync(SETTINGS_PATH)) return 'no settings';
+    const s = JSON.parse(stripJsonc(readFileSync(SETTINGS_PATH, 'utf8')));
+    if (s.hooks) {
+      for (const evt of Object.keys(s.hooks)) {
+        s.hooks[evt] = (s.hooks[evt] || []).filter(entry => {
+          const cmds = (entry.hooks || []).map(h => h.command || '').join(' ');
+          return !isZennHook(cmds);
+        });
+        if (s.hooks[evt].length === 0) delete s.hooks[evt];
+      }
+      if (Object.keys(s.hooks).length === 0) delete s.hooks;
     }
-    if (Object.keys(next.hooks).length === 0) delete next.hooks;
-  }
-  writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2));
-  console.log(`  ✓ Hooks removed from ${SETTINGS_PATH}`);
-
-  for (const agent of AGENTS) {
-    const p = path.join(AGENTS_DIR, agent);
-    if (existsSync(p)) {
-      unlinkSync(p);
-      console.log(`  ✓ Removed ${agent}`);
+    writeFileSync(SETTINGS_PATH, JSON.stringify(s, null, 2));
+    return 'hooks removed';
+  });
+  await step('Removing agents', async () => {
+    for (const a of AGENTS) {
+      const p = path.join(AGENTS_DIR, a);
+      if (existsSync(p)) unlinkSync(p);
     }
-  }
-
+    return 'agents removed';
+  });
+  await step('Removing /zenn command', async () => {
+    const p = path.join(COMMANDS_DIR, 'zenn.md');
+    if (existsSync(p)) unlinkSync(p);
+    return 'command removed';
+  });
+  await step('Removing state store', async () => {
+    if (existsSync(ZENN_DIR)) rmSync(ZENN_DIR, { recursive: true, force: true });
+    return 'state removed';
+  });
   console.log('');
-  console.log('Uninstall complete. Restart Claude Code.');
+  console.log(`  ${green('✓')} ${white(bold('Zenn uninstalled.'))}`);
+  console.log('');
 }
 
-function doctor() {
-  console.log('Running doctor...');
+async function runDoctor() {
+  banner();
   let ok = true;
+  const check = (label, pass, detail = '') => {
+    const mark = pass ? green('✓') : red('✗');
+    console.log(`  ${mark} ${white(label)}${detail ? `  ${dim(detail)}` : ''}`);
+    if (!pass) ok = false;
+  };
 
-  if (!existsSync(SETTINGS_PATH)) {
-    console.log('  ! settings.json not found');
-    ok = false;
-  } else {
-    const settings = JSON.parse(stripJsoncComments(readFileSync(SETTINGS_PATH, 'utf8')));
-    const hooks = settings.hooks || {};
-    for (const evt of HOOK_EVENTS) {
-      const entries = hooks[evt] || [];
-      const found = entries.some(e => (e.hooks || []).some(h => (h.command || '').includes(HOOK_SCRIPTS[evt])));
-      if (found) console.log(`  ✓ Hook ${evt}`);
-      else { console.log(`  ! Hook ${evt} missing`); ok = false; }
+  if (existsSync(SETTINGS_PATH)) {
+    const s = JSON.parse(stripJsonc(readFileSync(SETTINGS_PATH, 'utf8')));
+    for (const evt of Object.keys(HOOKS)) {
+      const found = (s.hooks?.[evt] || []).some(e =>
+        (e.hooks || []).some(h => (h.command || '').includes('hooks/session-start') ||
+                                   (h.command || '').includes('hooks/user-prompt-submit') ||
+                                   (h.command || '').includes('hooks/stop') ||
+                                   (h.command || '').includes('hooks/pre-compact')));
+      check(`hook ${evt}`, found);
     }
-  }
+  } else check('settings.json', false, 'missing');
 
-  for (const agent of AGENTS) {
-    const p = path.join(AGENTS_DIR, agent);
-    if (existsSync(p)) console.log(`  ✓ Agent ${agent}`);
-    else { console.log(`  ! Agent ${agent} missing`); ok = false; }
-  }
+  for (const a of AGENTS) check(`agent ${a.replace(/\.md$/, '')}`, existsSync(path.join(AGENTS_DIR, a)));
+  check('command /zenn', existsSync(path.join(COMMANDS_DIR, 'zenn.md')));
 
-  if (isActive()) console.log('  ✓ Enforcement ACTIVE');
-  else console.log('  ⚫ Enforcement OFF (run /suppresor-refusall on)');
-
-  if (ok) console.log('\nAll systems nominal.');
-  else { console.log('\nSome issues found. Run install again:'); console.log('  npx --yes github:petangZi/suppresor-refusall --repair'); }
+  console.log('');
+  console.log(ok ? `  ${green('All systems nominal.')}` : `  ${red('Issues found — re-run install.')}`);
+  console.log('');
 }
 
-main();
+// ---- entry ----
+const argv = process.argv.slice(2);
+if (argv.includes('--uninstall')) runUninstall().catch(err => { stopSpinner(err.message, false); process.exit(1); });
+else if (argv.includes('--doctor')) runDoctor();
+else runInstall().catch(err => { if (spinnerTimer) clearInterval(spinnerTimer); console.log(`  ${red('✗')} ${white(err.message)}`); process.exit(1); });
